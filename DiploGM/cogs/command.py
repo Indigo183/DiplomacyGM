@@ -2,8 +2,7 @@ from __future__ import annotations
 import inspect
 import logging
 from typing import TYPE_CHECKING
-
-from black.trans import defaultdict
+from collections import defaultdict
 from discord import Member
 from discord.ext import commands
 
@@ -16,7 +15,7 @@ from DiploGM.utils import (
 from DiploGM.manager import Manager, SEVERENCE_A_ID, SEVERENCE_B_ID
 from DiploGM.models.player import Player
 from DiploGM.models.province import ProvinceType
-from DiploGM.utils.sanitise import parse_season
+from DiploGM.utils.sanitise import parse_season, remove_prefix
 
 if TYPE_CHECKING:
     from DiploGM.models.board import Board
@@ -91,7 +90,7 @@ class CommandCog(commands.Cog):
         points_length = len(str(scoreboard_rows[0][1]))
 
         for index, player in scoreboard_rows:
-            if board.data["players"][player.name].get("hidden", "false") == "true":
+            if board.is_player_hidden(player):
                 continue
             response += (
                 f"\n\\#{index: >{index_length}} | {player.points: <{points_length}} | **{player.get_name()}**: "
@@ -111,7 +110,7 @@ class CommandCog(commands.Cog):
             board.datafile,
         )
         player_list = (
-            sorted(board.players, key=lambda p: p.get_name())
+            sorted(board.get_players(), key=lambda p: p.get_name())
             if alphabetical
             else board.get_players_sorted_by_score()
         )
@@ -123,7 +122,7 @@ class CommandCog(commands.Cog):
             else:
                 player_name = player.get_name()
 
-            if board.data["players"][player.name].get("hidden", "false") == "true":
+            if board.is_player_hidden(player):
                 continue
             response += (
                 f"\n**{player_name}**: "
@@ -151,12 +150,7 @@ class CommandCog(commands.Cog):
     async def scoreboard(self, ctx: commands.Context) -> None:
         """Outputs the scoreboard. Can be optionally sorted alphabetically."""
         assert ctx.guild is not None
-        arguments = (
-            ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}")
-            .strip()
-            .lower()
-            .split()
-        )
+        arguments = remove_prefix(ctx).lower().split()
         csv = "csv" in arguments
         alphabetical = len({"a", "alpha", "alphabetical"} & set(arguments)) > 0
 
@@ -166,7 +160,7 @@ class CommandCog(commands.Cog):
             perms.assert_gm_only(ctx, "get scoreboard")
 
         if csv and not board.is_chaos():
-            players = sorted(board.players, key=lambda p: p.name)
+            players = sorted(board.get_players(), key=lambda p: p.name)
             counts = map(lambda p: str(len(p.centers)), players)
             counts = "\n".join(counts)
             await ctx.send(counts)
@@ -202,15 +196,18 @@ class CommandCog(commands.Cog):
             message=f"Displayed info - {board.turn}|{str(board.datafile)}|"
             f"{'Open' if board.orders_enabled else 'Locked'}",
         )
+        message = f"Turn: {board.turn}\n"
+        message += f"Orders are {'Open' if board.orders_enabled else 'Locked'}\n"
+        message += f"Game Type: {str(board.datafile)}\n"
+        if board.data.get("deadline"):
+            message += f"Deadline: <t:{board.data['deadline']}:f>\n"
+        if board.is_chaos():
+            message += "Chaos: :white_check_mark:\n"
+        if board.fow:
+            message += "Fog of War: :white_check_mark:\n"
         await send_message_and_file(
             channel=ctx.channel,
-            message=(
-                f"Turn: {board.turn}\n"
-                f"Orders are {'Open' if board.orders_enabled else 'Locked'}\n"
-                f"Game Type: {str(board.datafile)}\n"
-                f"Chaos: {':white_check_mark:' if board.is_chaos() else ':x:'}\n"
-                f"Fog of War: {':white_check_mark:' if board.fow else ':x:'}"
-            ),
+            message=message,
         )
 
     @commands.command(
@@ -295,9 +292,7 @@ class CommandCog(commands.Cog):
             )
             return
 
-        province_name = ctx.message.content.removeprefix(
-            f"{ctx.prefix}{ctx.invoked_with}"
-        ).strip()
+        province_name = remove_prefix(ctx)
         if not province_name:
             log_command(logger, ctx, message="No province given")
             await send_message_and_file(
@@ -350,11 +345,14 @@ class CommandCog(commands.Cog):
                 adjacent_list.append(f"{adj[0] if isinstance(adj, tuple) else adj}")
             adjacent_coasts += "\n- ".join(sorted(adjacent_list))
             adjacent_coasts += "\n"
-        adjacent_sorted = sorted([adjacent.name for adjacent in province.adjacency_data.adjacent | province.adjacency_data.impassible_adjacent])
+        adjacent_sorted = sorted([adjacent.name for adjacent in province.adjacency_data.adjacent])
+        unit_text = ((province.unit.player.get_name() if province.unit.player is not None else '')
+                        + ' ' + province.unit.unit_type.name
+                    if province.unit else 'None')
         out = f"Type: {province.type.name}\n" + \
             f"{coast_info}" + \
-            f"Owner: {province.owner.name if province.owner else 'None'}\n" + \
-            f"Unit: {((province.unit.player.get_name() if province.unit.player is not None else '') + ' ' + province.unit.unit_type.name if province.unit else 'None')}\n" + \
+            f"Owner: {province.get_owner_name()}\n" + \
+            f"Unit: {unit_text}\n" + \
             f"Center: {province.has_supply_center}\n" + \
             f"Core: {province.core_data.core.name if province.core_data.core else 'None'}\n" + \
             f"Half-Core: {province.core_data.half_core.name if province.core_data.half_core else 'None'}\n" + \
@@ -396,9 +394,7 @@ class CommandCog(commands.Cog):
             )
             return
 
-        player_name = ctx.message.content.removeprefix(
-            f"{ctx.prefix}{ctx.invoked_with}"
-        ).strip()
+        player_name = remove_prefix(ctx)
         if not player_name:
             log_command(logger, ctx, message="No player given")
             await send_message_and_file(
@@ -525,7 +521,7 @@ class CommandCog(commands.Cog):
             prefix = prefix + "] "
         else:
             prefix = ""
-        name = ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}").strip()
+        name = remove_prefix(ctx)
         if name == "":
             await send_message_and_file(
                 channel=ctx.channel,
@@ -544,6 +540,18 @@ class CommandCog(commands.Cog):
         await send_message_and_file(
             channel=ctx.channel, message=f"Nickname updated to `{prefix + name}`"
         )
+
+    @commands.command(brief="Gets the current deadline",
+                      aliases=["deadline"])
+    async def get_deadline(self, ctx: commands.Context) -> None:
+        """Gets the current deadline."""
+        assert ctx.guild is not None
+        board = manager.get_board(ctx.guild.id)
+        deadline = board.data.get("deadline")
+        if deadline is None:
+            await send_message_and_file(channel=ctx.channel, message="No deadline set")
+            return
+        await send_message_and_file(channel=ctx.channel, message=f"Current deadline: <t:{deadline}:f>")
 
 async def setup(bot):
     """Sets up the cog."""

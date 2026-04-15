@@ -14,6 +14,7 @@ from DiploGM.utils import (
 from DiploGM.adjudicator.utils import svg_to_png
 from DiploGM.manager import Manager
 from DiploGM.models.player import Player
+from DiploGM.utils.sanitise import remove_prefix
 
 logger = logging.getLogger(__name__)
 manager = Manager()
@@ -52,9 +53,7 @@ class FogOfWarCog(commands.Cog):
         if not board.fow:
             raise ValueError("This is not a fog of war game")
 
-        filter_player = board.get_player(
-            ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}").strip()
-        )
+        filter_player = board.get_player(remove_prefix(ctx))
 
         await publish_map(
             ctx,
@@ -82,9 +81,7 @@ class FogOfWarCog(commands.Cog):
         if not board.fow:
             raise ValueError("This is not a fog of war game")
 
-        filter_player = board.get_player(
-            ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}").strip()
-        )
+        filter_player = board.get_player(remove_prefix(ctx))
 
         for category in guild.categories:
             if config.is_player_category(category):
@@ -95,7 +92,7 @@ class FogOfWarCog(commands.Cog):
             return "No player category found"
 
         name_to_player: dict[str, Player] = {}
-        for player in board.players:
+        for player in board.get_players():
             name_to_player[player.name.lower()] = player
 
         for channel in player_category.channels:
@@ -143,7 +140,7 @@ async def publish_map(
         raise RuntimeError("No player category found")
 
     name_to_player: dict[str, Player] = {}
-    for player in board.players:
+    for player in board.get_players():
         name_to_player[player.name.lower()] = player
 
     tasks = []

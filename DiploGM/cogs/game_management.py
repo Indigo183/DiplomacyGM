@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import random
 import re
+from datetime import timedelta
+from time import time
 from typing import Optional
 
 import discord.utils
@@ -12,13 +15,13 @@ from discord import (
     PermissionOverwrite,
     Role,
     TextChannel,
-    Thread,
     Guild,
 )
 from discord.ext import commands
 
 from DiploGM import config
-from DiploGM.config import ERROR_COLOUR, MAP_ARCHIVE_SAS_TOKEN
+from DiploGM.config import ERROR_COLOUR, MAP_ARCHIVE_SAS_TOKEN, PLAYER_CHANNEL_SUFFIX
+from DiploGM.db.database import get_connection
 from DiploGM.models.board import Board
 from DiploGM.parse_edit_state import parse_edit_state
 from DiploGM.parse_board_params import parse_board_params
@@ -29,15 +32,38 @@ from DiploGM.utils import (
     send_message_and_file,
     upload_map_to_archive,
 )
+from DiploGM.adjudicator.utils import svg_to_png
 
-from DiploGM.perms import is_gm
 from DiploGM.models.extension import ExtensionEvent, SQLiteExtensionEventRepository
 from DiploGM.models.order import Disband, Build
 from DiploGM.models.player import Player
 from DiploGM.manager import Manager, SEVERENCE_A_ID, SEVERENCE_B_ID
+from DiploGM.utils.sanitise import remove_prefix, sanitise_name
+from DiploGM.utils.send_message import ErrorMessage, send_error
 
 logger = logging.getLogger(__name__)
 manager = Manager()
+
+# Regex for parsing time deltas, e.g. "2 days 3h 15m"
+# Currently supports days, hours, minutes, and seconds and negative values
+# We could do more with this if need be, but this should hopefully work for now
+_TIMEDELTA_RE = re.compile(
+    r"(?:(-?\d+)\s*d(?:ays?)?)?\s*"
+    r"(?:(-?\d+)\s*h(?:(?:ou)?rs?)?)?\s*"
+    r"(?:(-?\d+)\s*m(?:in(?:ute)?s?)?)?\s*"
+    r"(?:(-?\d+)\s*s(?:ec(?:ond)?s?)?)?\s*$"
+)
+
+def _parse_timedelta(s: str) -> timedelta:
+    m = _TIMEDELTA_RE.fullmatch(s.strip())
+    if m and any(m.groups()):
+        return timedelta(
+            days=int(m.group(1) or 0),
+            hours=int(m.group(2) or 0),
+            minutes=int(m.group(3) or 0),
+            seconds=int(m.group(4) or 0),
+        )
+    raise ValueError(f"Cannot parse time duration: {s!r}")
 
 
 class GameManagementCog(commands.Cog):
@@ -46,39 +72,31 @@ class GameManagementCog(commands.Cog):
         self.grace_repo = SQLiteExtensionEventRepository()
 
     @commands.command(
-        brief="Create a game of Imp Dip and output the map.",
-        description="Create a game of Imp Dip and output the map. (there are no other variant options at this time)",
+        brief="Creates a new Diplomacy game.",
+        description="Creates a Diplomacy game of the chosen variant and optionally version.",
     )
     @perms.gm_only("create a game")
     async def create_game(self, ctx: commands.Context) -> None:
-        """Create a new initial game state tied to the server of invocation.
+        """Create a new game for the server.
 
         Usage: 
-            Used as `.create_game <gametype>`
+            `.create_game <gametype>`
 
-        Note: 
-            Limited to the server of command invocation
-            Default for <gametype> is "classic"
-            Valid <gametype> values can be found by running .list_variants
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+        Note:
+            Only one game per server can be created.
+            Default for <gametype> is "classic".
+            Variants are of the form <variant_name>.<variant_version>, e.g. "impdip.2.0".
+            If a version is not provided, will default to the latest-numbered version.
+            Available variants can be found by running .list_variants
         """
         assert ctx.guild is not None
-        gametype = ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}")
+        gametype = remove_prefix(ctx)
         if gametype == "":
             gametype = "classic"
         else:
             gametype = gametype.removeprefix(" ")
 
-        message = manager.create_game(ctx.guild.id, gametype)
+        success, message = manager.create_game(ctx.guild.id, gametype)
 
         welcome_message = "Welcome to the game!\n" + \
             "To submit orders, use the .order command, entering one order per line.\n" + \
@@ -87,40 +105,84 @@ class GameManagementCog(commands.Cog):
             "To create a private press channel, use .create_press_channel.\n" + \
             "For a list of all commands, use the .help command.\n" + \
             "Good luck!"
-        board = manager.get_board(ctx.guild.id)
-        for c in [cat for cat in ctx.guild.categories if config.is_player_category(cat)]:
-            for ch in c.text_channels:
-                player = board.get_player_by_channel(ch)
-                if not player:
-                    continue
-
-                await send_message_and_file(
-                    channel=ch,
-                    title="Welcome!",
-                    message=welcome_message,
-                )
+        if success:
+            board = manager.get_board(ctx.guild.id)
+            for c in [cat for cat in ctx.guild.categories if config.is_player_category(cat)]:
+                for ch in c.text_channels:
+                    player = board.get_player_by_channel(ch)
+                    if not player:
+                        continue
+                    await send_message_and_file(
+                        channel=ch,
+                        title="Welcome!",
+                        message=welcome_message,
+                    )
         log_command(logger, ctx, message=message)
         await send_message_and_file(channel=ctx.channel, message=message)
 
-    @commands.command(brief="permanently deletes a game, cannot be undone")
-    @perms.gm_only("delete the game")
-    async def delete_game(self, ctx: commands.Context) -> None:
-        """Deletes all references to the game within the database
+    @commands.command(brief="Exports the current game state as JSON")
+    @perms.gm_only("export the game")
+    async def export_game(self, ctx: commands.Context) -> None:
+        """Exports the current game state (players, provinces, parameters) as a JSON file."""
+        assert ctx.guild is not None
+        board = manager.get_board(ctx.guild.id)
+        json_str = board.export_game()
+        file_name = f"{board.datafile}_{str(board.turn).replace(' ', '_')}_export.json"
+        log_command(logger, ctx, message="Exported game state")
+        await send_message_and_file(
+            channel=ctx.channel,
+            title="Game Export",
+            file=json_str.encode("utf-8"),
+            file_name=file_name,
+        )
+
+    @commands.command(brief="Imports a game from a JSON file",
+                      description="Imports a new game from an uploaded JSON file.")
+    async def import_game(self, ctx: commands.Context) -> None:
+        """Imports a game from an uploaded JSON file.
 
         Usage: 
-            Used as `.delete_game`
+            `.import_game`, attaching a JSON file ideally from `.export_game`
 
-        Note: 
+        Note:
+            This command follows similar guidelines to .create_game
+            The uploaded file is expected to be a JSON file generated by the bot, ideally from `.export_game`.
+            You can modify the file before uploading, but do so at your own risk.
+        """
+        assert ctx.guild is not None
 
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
+        file = await ctx.message.attachments[0].read() if ctx.message.attachments else None
+        if file is None:
+            await send_message_and_file(
+                channel=ctx.channel,
+                message="No file attached. Please attach a JSON file to import a game.",
+                embed_colour=config.ERROR_COLOUR,
+            )
+            return
+        decoded_file = json.loads(file)
+        gametype = decoded_file.get("datafile", "classic")
 
-        Returns:
-            None
+        success, message = manager.create_game(ctx.guild.id, gametype)
+        if not success:
+            log_command(logger, ctx, message=message)
+            await send_message_and_file(channel=ctx.channel, message=message)
+            return
+        board = manager.get_board(ctx.guild.id)
+        message = board.import_game(decoded_file)
+        get_connection().save_board(ctx.guild.id, board)
+        log_command(logger, ctx, message=message)
+        await send_message_and_file(channel=ctx.channel, message=message)
 
-        Raises:
-            None:
-            Messages:
+    @commands.command(brief="Permanently deletes a game; cannot be undone")
+    @perms.gm_only("delete the game")
+    async def delete_game(self, ctx: commands.Context) -> None:
+        """Completely deletes the game in the server. Cannot be undone.
+
+        Usage:
+            `.delete_game`
+
+        Note:
+            Cannot be undone!
         """
 
         assert ctx.guild is not None
@@ -132,22 +194,7 @@ class GameManagementCog(commands.Cog):
     @perms.gm_only("lists variants")
     async def list_variants(self, ctx: commands.Context) -> None:
         """Lists all variants currently loaded into the bot.
-        To create a game of a specific variant, use `.create_game <variant>`
-
-        Usage: 
-            Used as `.list_variants`
-
-        Note: 
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+        To create a game of a specific variant, use `.create_game <variant>`.
         """
 
         assert ctx.guild is not None
@@ -155,7 +202,7 @@ class GameManagementCog(commands.Cog):
         log_command(logger, ctx, message=message)
         await send_message_and_file(channel=ctx.channel, title="Currently loaded variants", message=message)
 
-    @commands.command(brief="")
+    @commands.command(brief="Archives a comms category")
     @perms.gm_only("archive the category")
     async def archive(self, ctx: commands.Context) -> None:
         """Set all channels within a category to read-only, during game close
@@ -166,17 +213,6 @@ class GameManagementCog(commands.Cog):
         Note: 
             Removes all permission overwrites and sets "send_messages" to false
             Does not apply to Administrator roles
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
-                This channel is not part of a category
         """
 
         assert ctx.guild is not None
@@ -205,6 +241,84 @@ class GameManagementCog(commands.Cog):
         message = f"The following categories have been archived: {' '.join([category.name for category in categories])}"
         log_command(logger, ctx, message=f"Archived {len(categories)} Channels")
         await send_message_and_file(channel=ctx.channel, message=message)
+
+    @commands.command(
+        brief="Sets the current deadline",
+        description="""Manages the deadline for the current phase.
+        At the moment, this sets the default timestamp for the .ping_players command.
+        In the future, this might have more functionality.
+        """
+    )
+    @perms.gm_only("set deadline")
+    async def set_deadline(self, ctx: commands.Context) -> None:
+        """Manages the deadline for the current phase.
+
+        Usage: 
+            `.set_deadline <timestamp>`
+            `.set_deadline adjust <relative time, e.g. 2 days, -3h, etc.>`
+            `.set_deadline cancel`
+
+        Note: 
+            When orders are published, deadline is automatically advanced by 1-2 days depending on phase.
+        """
+        assert ctx.guild is not None
+        board = manager.get_board(ctx.guild.id)
+        content = remove_prefix(ctx)
+        adjust = content.startswith("adjust")
+        cancel = content.startswith("cancel")
+        if adjust:
+            content = content.removeprefix("adjust").strip()
+            deadline = int(board.data.get("deadline", time()))
+            try:
+                parsed_time = _parse_timedelta(content)
+            except ValueError as e:
+                await send_message_and_file(
+                    channel=ctx.channel,
+                    message=str(e),
+                    embed_colour=config.ERROR_COLOUR,
+                )
+                return
+            new_deadline = deadline + int(parsed_time.total_seconds())
+            board.data["deadline"] = new_deadline
+            logger.info(f"Adjusted deadline by {parsed_time} to {new_deadline}")
+            await send_message_and_file(
+                channel=ctx.channel,
+                message=f"Adjusted deadline by {parsed_time}. New deadline is <t:{int(new_deadline)}:R>.",
+            )
+        elif cancel:
+            board.data.pop("deadline", None)
+            new_deadline = None
+            logger.info("Removed deadline")
+            await send_message_and_file(
+                channel=ctx.channel,
+                message="Successfully removed deadline.",
+            )
+        else:
+            timestamp_match = re.search(r"(\d+)", content)
+            if not timestamp_match:
+                await send_message_and_file(
+                    channel=ctx.channel,
+                    message="Invalid timestamp format. Please provide a Unix timestamp.",
+                    embed_colour=config.ERROR_COLOUR,
+                )
+                return
+            new_deadline = int(timestamp_match.group(1))
+            board.data["deadline"] = new_deadline
+            logger.info(f"Set new deadline: {new_deadline}")
+            await send_message_and_file(
+                channel=ctx.channel,
+                message=f"Set new deadline: <t:{new_deadline}:R>.",
+            )
+        if new_deadline is not None:
+            get_connection().execute_arbitrary_sql(
+                "INSERT OR REPLACE INTO board_parameters (board_id, parameter_key, parameter_value) VALUES (?, ?, ?)",
+                (board.board_id, "deadline", new_deadline)
+            )
+        else:
+            get_connection().execute_arbitrary_sql(
+                "DELETE FROM board_parameters WHERE board_id = ? AND parameter_key = ?",
+                (board.board_id, "deadline")
+            )
 
     def _ping_player_builds(self,
                             player: Player,
@@ -250,9 +364,9 @@ class GameManagementCog(commands.Cog):
         return ""
 
     @commands.command(
-        brief="pings players who don't have the expected number of orders.",
+        brief="Pings players who don't have the expected number of orders.",
         description="""Pings all players in their orders channel that satisfy the following constraints:
-        1. They have too many build orders, or too little or too many disband orders. As of now, waiving builds doesn't lead to a ping.
+        1. They have too many build orders, or too little or too many disband orders.
         2. They are missing move orders or retreat orders.
         You may also specify a timestamp to send a deadline to the players.
         * .ping_players <timestamp>
@@ -264,35 +378,22 @@ class GameManagementCog(commands.Cog):
         """Pings all players with withstanding orders, listing number of needed orders and which units require them
 
         Usage: 
-            Used as `.ping_players <timestamp?>`
+            `.ping_players <timestamp?>`
 
         Note: 
-            Timestamp optional, will be formatted to "in XX hours" when displayed
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
-                No player category found / No player role found
-                No user found for player X
+            Timestamp optional, will be formatted to "in XX hours" when displayed.
+            If a deadline is set with .set_deadline, the timestamp will default to that time.
         """
 
         guild = ctx.guild
         assert guild is not None
         board = manager.get_board(guild.id)
+        timestamp = board.data.get("deadline")
 
         # extract deadline argument
-        timestamp = re.match(
-            r"<t:(\d+):[a-zA-Z]>",
-            ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}").strip(),
-        )
-        if timestamp:
-            timestamp = f"<t:{timestamp.group(1)}:R>"
+        parsed_timestamp = re.match(r"<t:(\d+):[a-zA-Z]>", remove_prefix(ctx))
+        if parsed_timestamp:
+            timestamp = parsed_timestamp.group(1)
 
         # get abstract player information
         player_roles: set[Role] = set()
@@ -302,11 +403,7 @@ class GameManagementCog(commands.Cog):
 
         if len(player_roles) == 0:
             log_command(logger, ctx, message="No player role found")
-            await send_message_and_file(
-                channel=ctx.channel,
-                message="No player category found",
-                embed_colour=config.ERROR_COLOUR,
-            )
+            await send_error(ctx.channel, ErrorMessage.NO_PLAYER_ROLE)
             return
 
         player_categories: list[CategoryChannel] = []
@@ -316,11 +413,7 @@ class GameManagementCog(commands.Cog):
 
         if len(player_categories) == 0:
             log_command(logger, ctx, message="No player category found")
-            await send_message_and_file(
-                channel=ctx.channel,
-                message="No player category found",
-                embed_colour=config.ERROR_COLOUR,
-            )
+            await send_error(ctx.channel, ErrorMessage.NO_PLAYER_CATEGORY)
             return
 
         # ping required players
@@ -331,7 +424,10 @@ class GameManagementCog(commands.Cog):
             for channel in category.text_channels:
                 player = board.get_player_by_channel(channel)
                 if player is None:
-                    await ctx.send(f"No Player for {channel.name}")
+                    continue
+
+                # player is completely dead, not worth pinging
+                if len(player.centers) + len(player.units) == 0:
                     continue
 
                 role = player.find_discord_role(guild.roles)
@@ -364,21 +460,30 @@ class GameManagementCog(commands.Cog):
                         if unit.order is None and
                             (board.turn.is_moves() or (unit == unit.province.dislodged_unit and unit.retreat_options))
                     ]
-                    unit_text = f"unit{'s' if len(missing) != 1 else ''}"
-                    if not missing:
+                    missing_dp = 0
+                    if board.data.get("dp", "False").lower() in ("true", "enabled"):
+                        missing_dp = player.dp_max - board.get_dp_spent(player)
+
+                    if not missing and missing_dp == 0:
                         continue
 
-                    response = f"Hey **{''.join([u.mention for u in users])}**, " + \
-                        f"you are missing moves for the following {len(missing)} {unit_text}:"
-                    for unit in sorted(
-                        missing, key=lambda _unit: _unit.province.name
-                    ):
-                        response += f"\n{unit}"
+                    unit_text = f"unit{'s' if len(missing) != 1 else ''}"
+                    response = f"Hey **{''.join([u.mention for u in users])}**, "
+                    if missing:
+                        response += f"you are missing moves for the following {len(missing)} {unit_text}:"
+                        for unit in sorted(
+                            missing, key=lambda _unit: _unit.province.name
+                        ):
+                            response += f"\n{unit}"
+                    if missing_dp > 0:
+                        response += f"{'\nY' if missing else 'y'}ou have {missing_dp} unspent DP."
+                    elif missing_dp < 0:
+                        response += f"{'\nY' if missing else 'y'}ou have spent {-missing_dp} too much DP."
 
                 if response:
                     pinged_players += 1
                     if timestamp:
-                        response += f"\n The orders deadline is {timestamp}."
+                        response += f"\n The orders deadline is <t:{timestamp}:R>."
                     await channel.send(response)
                     response = None
 
@@ -396,8 +501,8 @@ class GameManagementCog(commands.Cog):
             )
 
     @commands.command(
-        brief="disables orders until .unlock_orders is run.",
-        description="""disables orders until .enable_orders is run.
+        brief="Disables orders until .unlock_orders is run",
+        description="""Disables orders until .enable_orders is run.
                  Note: Currently does not persist after the bot is restarted""",
         aliases=["lock"],
     )
@@ -406,18 +511,7 @@ class GameManagementCog(commands.Cog):
         """Sets board flag to prevent new order submissions
 
         Usage: 
-            Used as `.lock_orders`
-
-        Note: 
-
-        Args:
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            `.lock_orders`
         """
 
         assert ctx.guild is not None
@@ -430,24 +524,13 @@ class GameManagementCog(commands.Cog):
             message=f"{board.turn}",
         )
 
-    @commands.command(brief="re-enables orders", aliases=["unlock"])
+    @commands.command(brief="Re-enables orders", aliases=["unlock"])
     @perms.gm_only("unlock orders")
     async def unlock_orders(self, ctx: commands.Context) -> None:
         """Sets board flag to enable new order submissions
 
         Usage: 
-            Used as `.unlock_orders`
-
-        Note: 
-
-        Args:
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            `.unlock_orders`
         """
 
         assert ctx.guild is not None
@@ -460,54 +543,39 @@ class GameManagementCog(commands.Cog):
             message=f"{board.turn}",
         )
 
-    @commands.group(name="grace", brief="", invoke_without_command=True)
+    @commands.group(name="grace", brief="Manages graces", invoke_without_command=True)
     @perms.gm_only("handle graces")
     async def grace(self, ctx: commands.Context) -> None:
-        """Entry point for Grace logging command group
+        """Command to log and view graces, which occur when adjudication is delayed due to a player missing orders.
+        Use one of the following subcommands to manage graces:
 
         Usage: 
-            Used as `.grace`
+            `.grace log <user> <hours> <reason>`
+            `.grace view user <user>`
+            `.grace view server <server_id?>`
+            `.grace delete <grace_id>`
 
         Note: 
-            # TODO: could maybe be made into a cog
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            For more detailed information on each subcommand, use `.help grace <subcommand>`
         """
         await send_message_and_file(channel=ctx.channel, message="Valid commands are: *log*, *delete*, and *view*")
 
-    @grace.command(name="log", brief="log grace", description="Usage: .grace <user> <hours> <reason>")
+    @grace.command(name="log", brief="Logs a grace period", description="Usage: .grace <user> <hours> <reason>")
     @perms.gm_only("record a grace")
     async def grace_log(self, ctx: commands.Context, user: User, hours: float, *, reason: str = "Unspecified") -> None:
         """Store a record of grace in a game, grace can be NMR or Extension and should be detailed in the reason
 
         Usage: 
-            Used as `.grace log <user> <hours> <reason>`
+            `.grace log     <user> <hours> <reason>`
 
         Note: 
             Can't log for bots
             Can log for any discord user
 
         Args:
-            ctx (commands.Context): Context from discord regarding command invocation
             user (discord.User): User that has committed the grace
             hours (float): Time grace lasted/set to last
             reason (str): Why was the grace stored
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
-                User is a bot!
         """
         assert ctx.guild is not None
 
@@ -530,49 +598,34 @@ class GameManagementCog(commands.Cog):
                                     message=f"Logged under: {user.mention}\nHours: {hours}")
 
     @grace.command(name="delete")
-    @perms.gm_only("delete a recorded grace")
+    @perms.gm_only("Delete a recorded grace")
     async def grace_delete(self, ctx: commands.Context, grace_id: int) -> None:
         """Delete a record of grace from the database
 
         Usage: 
-            Used as `.grace delete <grace_id>`
+            `.grace delete <grace_id>`
 
         Note: 
             Will return positive message even if no record for ID
+            Use .grace view to find grace IDs
 
         Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-            grace_id (int): Target Grace ID -> PK in Table
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            grace_id (int): Target Grace ID
         """
         self.grace_repo.delete(grace_id)
         await send_message_and_file(channel=ctx.channel,
                                     message=f"If a grace with ID {grace_id} existed, it exists no longer :fire:")
 
-    @grace.group(name="view", invoke_without_command=True)
+    @grace.group(name="view", brief="Views grace records", invoke_without_command=True)
     async def grace_view(self, ctx: commands.Context) -> None:
-        """Entry point for Grace log viewing command group
+        """Views grace records for a user or server
 
         Usage: 
-            Used as `.grace view`
+            `.grace view user <user>`
+            `.grace view server <server_id?>`
 
-        Note: 
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+        Note:
+            For more detailed information on each subcommand, use `.help grace view <subcommand>`
         """
         await send_message_and_file(channel=ctx.channel, message="Valid commands are: *user* and *server*")
 
@@ -582,22 +635,14 @@ class GameManagementCog(commands.Cog):
         """View the grace record for a specific user
 
         Usage: 
-            Used as `.grace view user <user>`
+            `.grace view user <user>`
 
         Note: 
             Groups by server graces are logged in
             Records sorted by server_id (newer servers?) then creation datetime
 
         Args:
-            ctx (commands.Context): Context from discord regarding command invocation
             user (discord.User): User to check
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
         """
         events = self.grace_repo.load_by_user(user.id)
 
@@ -626,23 +671,14 @@ class GameManagementCog(commands.Cog):
         """View the grace record for the current server
 
         Usage: 
-            Used as `.grace view server <id>`
+            `.grace view server <server_id?>`
 
         Note: 
             Groups by server graces are logged in
             Records sorted by server_id (newer servers?) then creation datetime
 
         Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-            id (Optional[int], default=None): ID of the server to view
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
-                Invalid guild ID
+            server_id (Optional[int], default=None): ID of the server to view
         """
         assert ctx.guild is not None
 
@@ -673,7 +709,6 @@ class GameManagementCog(commands.Cog):
 
         await send_message_and_file(channel=ctx.channel, title=f"Graces in {gname}", message=out)
 
-
     async def _post_orders(self, ctx: commands.Context, board: Board) -> str:
         assert ctx.guild is not None
 
@@ -687,11 +722,7 @@ class GameManagementCog(commands.Cog):
                 message="Failed for an unknown reason",
                 level=logging.ERROR,
             )
-            await send_message_and_file(
-                channel=ctx.channel,
-                title="Unknown Error: Please contact your local bot dev",
-                embed_colour=config.ERROR_COLOUR,
-            )
+            await send_error(ctx.channel, ErrorMessage.UNKNOWN_ERROR)
             return ""
         orders_log_channel = _get_orders_log(ctx.guild)
         if not orders_log_channel or not isinstance(orders_log_channel, TextChannel):
@@ -726,13 +757,13 @@ class GameManagementCog(commands.Cog):
 
         extra_info = {}
         if curr_board.turn.is_retreats():
-            for player in curr_board.players:
+            for player in curr_board.get_players():
                 units_to_retreat = sorted([str(u) for u in player.units if len(u.retreat_options or []) > 0])
                 if len(units_to_retreat) > 0:
                     extra_info[player.name] = "**Units to retreat**:\n" + '\n'.join(units_to_retreat)
         elif (curr_board.turn.is_builds()
               and (old_board := manager._database.get_old_board(board, board.turn.get_previous_turn())) is not None):
-            for player in curr_board.players:
+            for player in curr_board.get_players():
                 old_player = old_board.get_player(player.name)
                 if not old_player:
                     continue
@@ -765,14 +796,38 @@ class GameManagementCog(commands.Cog):
                     ),
                 )
 
+    async def _update_deadline(self, ctx: commands.Context, guild_id: int) -> None:
+        board = manager.get_board(guild_id)
+        if not (timestamp := board.data.get("deadline")):
+            return
+        phase_length = 2 if board.turn.is_moves() else 1
+        board.data["deadline"] = int(timestamp) + 60 * 60 * 24 * phase_length
+        get_connection().execute_arbitrary_sql(
+            "INSERT OR REPLACE INTO board_parameters (board_id, parameter_key, parameter_value) VALUES (?, ?, ?)",
+            (board.board_id, "deadline", board.data["deadline"])
+        )
+        await send_message_and_file(
+            channel=ctx.channel,
+            message=f"Updated deadline to <t:{board.data['deadline']}:f>.")
+
     @commands.command(
-        brief="Sends all previous orders",
+        brief="Publishes orders to #orders-log",
         description="For GM: Sends orders from previous phase to #orders-log",
     )
     @perms.gm_only("publish orders")
     async def publish_orders(self, ctx: commands.Context, *args) -> None:
         """Publishes orders to the orders log channel, uploads the map to the archive,
-        and informs players about the phase change."""
+        and informs players about the phase change.
+        
+        Usage:
+            `.publish_orders`
+            `.publish_orders silent` - does not post in orders channels about phase changes
+        
+        Note:
+            If a deadline is set, automatically updates the deadline by 1-2 days depending on phase.
+            Posts in player channels information about the phase change unless "silent" is passed.
+            If configured, also uploads the map to the archive.
+        """
         guild = ctx.guild
         assert guild is not None
         arguments = [arg.lower() for arg in args]
@@ -794,6 +849,9 @@ class GameManagementCog(commands.Cog):
             file, _ = manager.draw_map_for_board(board, draw_moves=True)
             _ = asyncio.create_task(upload_map_to_archive(ctx, guild.id, board, file))
 
+        if board.data.get("deadline"):
+            _ = asyncio.create_task(self._update_deadline(ctx, guild.id))
+
     async def _is_missing_orders(self, board: Board) -> bool:
         if board.turn.is_moves():
             for unit in board.units:
@@ -808,7 +866,7 @@ class GameManagementCog(commands.Cog):
                     return True
 
         if board.turn.is_builds():
-            for player in board.players:
+            for player in board.get_players():
                 count = len(player.centers) - len(player.units)
                 current = player.waived_orders
                 for order in player.build_orders:
@@ -822,35 +880,40 @@ class GameManagementCog(commands.Cog):
         return False
 
     @commands.command(
-        brief="Adjudicates the game and outputs the moves and results maps.",
-        description="""
-        GMs may append true as an argument to this command to instead get the base svg file.
-        * adjudicate {arguments}
-        Arguments: 
-        * pass true|t|svg|s to return an svg
-        * pass standard, dark, blue, or pink for different color modes if present
-        * pass test to view maps without doing an actual adjudication
-        * pass full to automatically publish orders and maps
-        * pass confirm to force adjudication even if there are missing orders
-        """,
+        brief="Adjudicates the game",
+        description="Adjudicates the game and uploads maps.",
         aliases=["adju", "adjudication"]
     )
     @perms.gm_only("adjudicate")
     async def adjudicate(self, ctx: commands.Context) -> None:
-        """Tells the game to adjudicate."""
+        """Adjudicates the game, and publishes the orders and results maps.
+        
+        Usage:
+            `.adjudicate [arguments]`
+        
+        Args:
+            `test`: Runs a test adjudication without touching the actual game state.
+            `full`: Locks orders, adjudicates, uploads maps, publishes orders, and then unlocks orders.
+            `<color_mode>`: Publishes maps with a specific color scheme.
+            `confirm`: Adjudicates even if there are missing orders.
+            `svg`: Uploads the maps as SVGs instead of PNGs.
+        
+        Note:
+            By default, the command will not adjudicate if there are missing orders.
+            Use the "confirm" argument to override this.
+            Arguments can be combined as desired, so `.adjudicate full svg dark confirm` is valid.
+            If `svg` and `full` are included, maps will still be uploaded as PNGs to the #maps channel.
+            To undo an adjudication, use `.rollback`.
+        """
         guild = ctx.guild
         assert guild is not None
 
         board = manager.get_board(guild.id)
+        color_options = board.data["svg config"].get("color_options", {"standard"})
 
-        arguments = (
-            ctx.message.content.removeprefix(f"{ctx.prefix}{ctx.invoked_with}")
-            .strip()
-            .lower()
-            .split()
-        )
+        arguments = remove_prefix(ctx).lower().split()
         return_svg = not ({"true", "t", "svg", "s"} & set(arguments))
-        color_arguments = list(config.color_options & set(arguments))
+        color_arguments = list(set(color_options) & set(arguments))
         color_mode = color_arguments[0] if color_arguments else None
         test_adjudicate = "test" in arguments
         full_adjudicate = "full" in arguments and not test_adjudicate
@@ -878,43 +941,47 @@ class GameManagementCog(commands.Cog):
             ctx,
             message=f"Adjudication Successful for {board.turn}",
         )
-        file, file_name = manager.draw_map(
-            guild.id,
+
+        # We draw the board from the DB to apply failed and DP orders that we want to hide from players
+        draw_board = manager.get_board_from_db(guild.id, old_turn)
+        manager.apply_adjudication_results(guild.id, draw_board)
+        file, file_name = manager.draw_map_for_board(
+            draw_board,
             draw_moves=True,
-            player_restriction=None,
             color_mode=color_mode,
-            turn=old_turn,
         )
         title = f"{board.name} — " if board.name else ""
         title += f"{old_turn}"
+
+        converted_file: bytes | None = None
+        converted_file_name: str | None = None
+        needs_png = return_svg or (full_adjudicate and _get_maps_channel(guild))
+        if needs_png:
+            converted_file, converted_file_name = await svg_to_png(file, file_name)
         await send_message_and_file(
             channel=ctx.channel,
             title=f"{title} Orders Map",
             message="Test adjudication" if test_adjudicate else "",
-            file=file,
-            file_name=file_name,
-            convert_svg=return_svg,
+            file=converted_file if return_svg else file,
+            file_name=converted_file_name if return_svg else file_name,
         )
         if full_adjudicate and (map_channel := _get_maps_channel(guild)):
             map_message = await send_message_and_file(
                 channel=map_channel,
                 title=f"{title} Orders Map",
-                file=file,
-                file_name=file_name,
-                convert_svg=True,
+                file=converted_file,
+                file_name=converted_file_name,
             )
             try:
                 await map_message.publish()
-            except:
+            except discord.Forbidden:
                 pass
 
         if movement_adjudicate:
-            file, file_name = manager.draw_map(
-                guild.id,
+            file, file_name = manager.draw_map_for_board(
+                draw_board,
                 draw_moves=True,
-                player_restriction=None,
                 color_mode=color_mode,
-                turn=old_turn,
                 movement_only=True,
             )
             title = f"{board.name} — " if board.name else ""
@@ -929,26 +996,28 @@ class GameManagementCog(commands.Cog):
             )
 
         file, file_name = manager.draw_map_for_board(new_board, color_mode=color_mode)
+
+        needs_png = return_svg or (full_adjudicate and _get_maps_channel(guild))
+        if needs_png:
+            converted_file, converted_file_name = await svg_to_png(file, file_name)
         await send_message_and_file(
             channel=ctx.channel,
             title=f"{title} Results Map",
             message="Test adjudication results" if test_adjudicate else "",
-            file=file,
-            file_name=file_name,
-            convert_svg=return_svg,
+            file=converted_file if return_svg else file,
+            file_name=converted_file_name if return_svg else file_name,
         )
 
         if full_adjudicate and (map_channel := _get_maps_channel(guild)):
             map_message = await send_message_and_file(
                 channel=map_channel,
                 title=f"{title} Results Map",
-                file=file,
-                file_name=file_name,
-                convert_svg=True,
+                file=converted_file,
+                file_name=converted_file_name,
             )
             try:
                 await map_message.publish()
-            except:
+            except discord.Forbidden:
                 pass
 
         if full_adjudicate:
@@ -977,7 +1046,7 @@ class GameManagementCog(commands.Cog):
         if (new_board.turn.is_builds()
             and (guild.id != config.BOT_DEV_SERVER_ID and guild.name.startswith("Imperial Diplomacy"))
             and not test_adjudicate):
-            channel = self.bot.get_channel(config.IMPDIP_SERVER_WINTER_SCOREBOARD_OUTPUT_CHANNEL_ID)
+            channel = self.bot.get_channel(config.HUB_SERVER_WINTER_SCOREBOARD_OUTPUT_CHANNEL_ID)
             if not channel:
                 await send_message_and_file(channel=ctx.channel,
                                             message="Couldn't automatically send off the Winter Scoreboard data",
@@ -985,33 +1054,22 @@ class GameManagementCog(commands.Cog):
                 return
             title = f"### {guild.name} Centre Counts (alphabetical order) | {new_board.turn}"
 
-            players = sorted(new_board.players, key=lambda p: p.get_name())
+            players = sorted(new_board.get_players(), key=lambda p: p.get_name())
             counts = "\n".join(map(lambda p: str(len(p.centers)), players))
 
             await channel.send(title)
             await channel.send(counts)
 
-    @commands.command(brief="Rolls back to the previous game state.")
+    @commands.command(brief="Rolls back the game to the previous turn")
     @perms.gm_only("rollback")
     async def rollback(self, ctx: commands.Context) -> None:
         """Rolls back the game board to the previous phase
 
         Usage: 
-            Used as `.rollback`
+            `.rollback`
 
         Note: 
-            Limited to the server of command invocation
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
-                No board for the previous phase
+            Will clear any orders in the current phase before rolling back.
         """
 
         assert ctx.guild is not None
@@ -1022,23 +1080,10 @@ class GameManagementCog(commands.Cog):
     @commands.command(brief="Reloads the current board with what is in the DB")
     @perms.gm_only("reload")
     async def reload(self, ctx: commands.Context) -> None:
-        """Reloads the board state currently saved in the database
+        """Reloads the board state currently saved in the database.
 
         Usage: 
-            Used as `.reload`
-
-        Note: 
-            Limited to the server of command invocation
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            `.reload`
         """
 
         assert ctx.guild is not None
@@ -1047,7 +1092,7 @@ class GameManagementCog(commands.Cog):
         await send_message_and_file(channel=ctx.channel, message=message, file=file, file_name=file_name)
 
     @commands.command(
-        brief="Edits the game state and outputs the results map.",
+        brief="Edits the game state and outputs the results map",
         description="""Edits the game state and outputs the results map.
         There must be one and only one command per line.
         Note: you cannot edit immalleable map state (eg. province adjacency).
@@ -1064,8 +1109,6 @@ class GameManagementCog(commands.Cog):
         * move_unit <province_name> <province_name>
         * dislodge_unit <province_name> <retreat_option1> <retreat_option2>...
         * make_units_claim_provinces {True|(False) - whether or not to claim SCs}
-        * .create_player <player_name> <color_code> <win_type> <vscc> <iscc> {extends into the game's history, no starting centres/units}
-        * .delete_player <player_name>
         * set_player_points <player_name> <integer>
         * set_player_vassal <liege> <vassal>
         * remove_relationship <player1> <player2>
@@ -1078,28 +1121,13 @@ class GameManagementCog(commands.Cog):
     )
     @perms.gm_only("edit")
     async def edit(self, ctx: commands.Context) -> None:
-        """God edit the board state
+        """Edits the current board state
 
         Usage: 
-            Used as `.edit <commands>`
-
-        Note: 
-            Outsources to `parse_edit_state.py`
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            `.edit <commands>`
         """
         assert ctx.guild is not None
-        edit_commands = ctx.message.content.removeprefix(
-            f"{ctx.prefix}{ctx.invoked_with}"
-        ).strip()
+        edit_commands = remove_prefix(ctx)
         title, message, file, file_name, embed_colour = parse_edit_state(edit_commands, manager.get_board(ctx.guild.id))
         log_command(logger, ctx, message=title)
         await send_message_and_file(channel=ctx.channel,
@@ -1110,7 +1138,7 @@ class GameManagementCog(commands.Cog):
                                     embed_colour=embed_colour)
 
     @commands.command(
-        brief="blitz",
+        brief="Blitz game channel creation",
         description="Creates all possible channels between two players for blitz in available comms channels.",
     )
     @perms.gm_only("create blitz comms channels")
@@ -1118,25 +1146,15 @@ class GameManagementCog(commands.Cog):
         """Creates all pairwise press channels between players in a game
 
         Usage: 
-            Used as `.botsay #channel message`
+            `.blitz`
 
         Note: 
-            Uses the board.players list (which is read from the config)
-
-        Args:
-            ctx (commands.Context): Context from discord regarding command invocation
-
-        Returns:
-            None
-
-        Raises:
-            None:
-            Messages:
+            Uses the board.get_players() method (which is read from the config)
         """
         assert ctx.guild is not None
         board = manager.get_board(ctx.guild.id)
         cs = []
-        pla = sorted(board.players, key=lambda p: p.get_name())
+        pla = sorted(board.get_players(), key=lambda p: p.get_name())
         for p1 in pla:
             for p2 in pla:
                 if p1.name < p2.name:
@@ -1158,7 +1176,7 @@ class GameManagementCog(commands.Cog):
 
         name_to_player: dict[str, Player] = dict()
         player_to_role: dict[Player | None, Role] = dict()
-        for player in board.players:
+        for player in board.get_players():
             name_to_player[player.get_name().lower()] = player
 
         spectator_role = None
@@ -1177,7 +1195,7 @@ class GameManagementCog(commands.Cog):
             )
             return
 
-        for player in board.players:
+        for player in board.get_players():
             if not player_to_role.get(player):
                 await send_message_and_file(
                     channel=ctx.channel,
@@ -1196,7 +1214,7 @@ class GameManagementCog(commands.Cog):
 
             name, p1, p2 = cs.pop(0)
 
-            overwrites = {
+            overwrites: dict[discord.Role | discord.Member | discord.Object, PermissionOverwrite] = {
                 guild.default_role: PermissionOverwrite(view_channel=False),
                 spectator_role: PermissionOverwrite(view_channel=True),
                 player_to_role[p1]: PermissionOverwrite(view_channel=True),
@@ -1207,9 +1225,37 @@ class GameManagementCog(commands.Cog):
 
             available -= 1
 
-    @commands.command(brief="publicize void for chaos")
+    @commands.command(brief="Gets player activity",
+                      description="""Gets the last time each player sent a message.""")
+    @perms.gm_only("get last message times")
+    async def last_message(self, ctx: commands.Context) -> None:
+        """Gets the last time each player sent a message.
+
+        Usage: 
+            `.last_message`
+
+        Note: 
+            This data does not persist across bot restarts.
+            Does not differentiate between orders, press, or other messages.
+        """
+        assert ctx.guild is not None
+
+        last_message_dict = manager.last_activity.get(ctx.guild.id, {})
+        last_message_times: list[tuple[str, float]] = []
+        for player in manager.get_board(ctx.guild.id).get_players():
+            last_message_times.append((player.get_name(), last_message_dict.get(player.name, 0.0)))
+        last_message_times.sort(key=lambda x: x[1], reverse=True)
+        message = "\n".join([f"{player}: <t:{int(last)}:R>"
+                             if last != 0.0
+                             else f"{player}: No messages seen"
+                             for player, last in last_message_times])
+        await send_message_and_file(channel=ctx.channel, title="Last Message Times", message=message)
+
+    # Commenting out Chaos-only commands for readability
+    """
+    @commands.command(brief="Publicize void for chaos")
     async def publicize(self, ctx: commands.Context) -> None:
-        """Opens a channel (usually a void) to the spectator role
+        \"""Opens a channel (usually a void) to the spectator role
 
         Usage: 
             Used as `.publicize`
@@ -1229,7 +1275,7 @@ class GameManagementCog(commands.Cog):
                 You are not a GM
                 This is not a chaos game
                 Could not find applicable user
-        """
+        \"""
         assert ctx.guild is not None
         if not is_gm(ctx.message.author):
             raise PermissionError(
@@ -1309,17 +1355,19 @@ class GameManagementCog(commands.Cog):
         await send_message_and_file(
             channel=channel, message="Finished publicizing void."
         )
+    """
 
     @commands.command(
-        brief="edit_game",
+        brief="Edits game parameters",
         description="""Modifies a game parameter to a certain value.
         There must be one and only one command per line.
-        Note: you cannot edit immalleable map state (eg. province adjacency, players).
+        Note: you cannot edit immalleable map state (eg. province adjacency).
         The following are the supported parameters and possible values:
         * building ['classic', 'cores', 'control', 'anywhere']
         * convoyable_islands ['disabled', 'enabled']
         * supportable_cores ['disabled', 'enabled']
         * transformation ['disabled', 'moves', 'builds', 'all']
+        * dp ['disabled', 'enabled']
         * victory_conditions ['classic', 'vscc']
         * victory_count [number] (only used with classic victory conditions)
         * iscc [player] [starting scs]
@@ -1331,10 +1379,13 @@ class GameManagementCog(commands.Cog):
     )
     @perms.gm_only("edit game")
     async def edit_game(self, ctx: commands.Context) -> None:
+        """Edits game parameters.
+
+        Usage: 
+            `.edit_game <commands>`
+        """
         assert ctx.guild is not None
-        param_commands = ctx.message.content.removeprefix(
-            f"{ctx.prefix}{ctx.invoked_with}"
-        ).strip()
+        param_commands = remove_prefix(ctx)
         title, message, file, file_name, embed_colour = parse_board_params(param_commands,
                                                                            manager.get_board(ctx.guild.id))
         log_command(logger, ctx, message=title)
@@ -1344,6 +1395,73 @@ class GameManagementCog(commands.Cog):
                                     file=file,
                                     file_name=file_name,
                                     embed_colour=embed_colour)
+
+    @commands.command(brief="Renames a player",
+                      description="Renames a player, and updates their role and channel names")
+    @perms.gm_only("rename player")
+    async def rename_player(self, ctx: commands.Context, old_name: str, new_name: str) -> None:
+        """Renames a player, and updates their role and channel names if possible.
+
+        Usage: 
+            `.rename_player <old_name> <new_name>`
+
+        Note:
+            To include a space in a name, surround the name with quotes.
+            You cannot rename a player to have the same name as another existing player.
+        """
+        assert ctx.guild is not None
+        message = ""
+        board = manager.get_board(ctx.guild.id)
+        if not (player := board.get_player(old_name)):
+            await send_message_and_file(
+                channel=ctx.channel,
+                message=f"Could not find a player with the name {old_name}",
+                embed_colour=config.ERROR_COLOUR,
+            )
+            return
+
+        old_role = player.find_discord_role(ctx.guild.roles)
+        old_order_role = player.find_discord_role(ctx.guild.roles, get_order_role=True)
+        order_channel_name = player.get_name().lower().replace(" ", "-") + PLAYER_CHANNEL_SUFFIX
+        void_channel_name = player.get_name().lower().replace(" ", "-") + "-void"
+
+        has_removed_nickname = board.add_nickname(player, new_name)
+        if has_removed_nickname:
+            get_connection().execute_arbitrary_sql(
+                "DELETE FROM board_parameters WHERE board_id = ? AND parameter_key = ?",
+                (board.board_id, f"players/{player.name}/nickname")
+            )
+        else:
+            get_connection().execute_arbitrary_sql(
+                "INSERT OR REPLACE INTO board_parameters (board_id, parameter_key, parameter_value) VALUES (?, ?, ?)",
+                (board.board_id, f"players/{player.name}/nickname", new_name)
+            )
+        message += f"Renamed player {old_name} to {new_name}."
+
+        if old_role:
+            await old_role.edit(name = sanitise_name(new_name))
+            message += f"\nUpdated role {sanitise_name(old_name)} to {sanitise_name(new_name)}."
+        if old_order_role:
+            await old_order_role.edit(name = sanitise_name(new_name) + PLAYER_CHANNEL_SUFFIX)
+            message += f"\nUpdated order role {sanitise_name(old_name)}{PLAYER_CHANNEL_SUFFIX} " + \
+                       f"to {sanitise_name(new_name)}{PLAYER_CHANNEL_SUFFIX}."
+
+        order_channel = discord.utils.find(lambda c: c.name == order_channel_name, ctx.guild.text_channels)
+        if order_channel:
+            await order_channel.edit(name = new_name.lower().replace(" ", "-") + PLAYER_CHANNEL_SUFFIX)
+            message += f"\nUpdated order channel {order_channel_name} to " + \
+                       f"{new_name.lower().replace(" ", "-") + PLAYER_CHANNEL_SUFFIX}."
+
+        void_channel = discord.utils.find(lambda c: c.name == void_channel_name, ctx.guild.text_channels)
+        if void_channel:
+            await void_channel.edit(name = new_name.lower().replace(" ", "-") + "-void")
+            message += f"\nUpdated void channel {void_channel_name} to {new_name.lower().replace(" ", "-") + "-void"}."
+
+        log_command(logger, ctx, message=message)
+        await send_message_and_file(
+            channel=ctx.channel,
+            message=message,
+        )
 
 async def setup(bot):
     cog = GameManagementCog(bot)

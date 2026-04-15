@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from DiploGM.models.board import Board
     from DiploGM.models.player import Player
     from DiploGM.models.unit import Unit
+    from DiploGM.models.order import UnitOrder
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,27 @@ class MovesAdjudicator(Adjudicator):
         super().__init__(board)
 
         self.orders: set[AdjudicableOrder] = set()
+        self.dp_order_strings: dict[str, tuple[str, str | None, str | None]] = {}
+
+        # Check to make sure people don't over-allocate DP, and remove over-allocated DP orders
+        for player in board.get_players():
+            points_available = player.dp_max
+            for unit, allocation in board.get_player_dp_orders(player).items():
+                if allocation.points > points_available:
+                    logger.info(f"Player {player} allocated more DP than they have. Skipping this DP orders")
+                    unit.dp_allocations.pop(player.name)
+                    break
+                points_available -= allocation.points
+
+        # For each unit, assign a DP order if appropriate
+        for unit in board.units:
+            if unit.order is None and (best_order := board.get_winning_dp_order(unit)) is not None:
+                unit.order = best_order
+                self.dp_order_strings[str(unit.province)] = (
+                    type(unit.order).__name__,
+                    unit.order.get_destination_str(),
+                    unit.order.get_source_str()
+                )
 
         # run supports after everything else since illegal cores / moves should be treated as holds
         units = sorted(board.units, key=lambda unit: isinstance(unit.order, Support))
@@ -125,7 +147,7 @@ class MovesAdjudicator(Adjudicator):
             else:
                 order.base_unit.unit_type = UnitType.ARMY
                 order.base_unit.coast = None
-        if order.type == OrderType.MOVE and order.resolution == Resolution.SUCCEEDS:
+        if order.type == OrderType.MOVE and not order.is_sortie and order.resolution == Resolution.SUCCEEDS:
             logger.debug(f"Moving {order.source_province} to {order.destination_province}")
             if order.source_province.unit == order.base_unit:
                 order.source_province.unit = None
@@ -247,7 +269,7 @@ class MovesAdjudicator(Adjudicator):
         if order.type == OrderType.HOLD:
             # Resolution is arbitrary for holds; they don't do anything
             return Resolution.SUCCEEDS
-        elif order.type in (OrderType.CORE, OrderType.TRANSFORM, OrderType.SUPPORT):
+        if order.type in (OrderType.CORE, OrderType.TRANSFORM, OrderType.SUPPORT):
             # These orders fail if attacked by nation, even if that order isn't successful
             moves_here = self.moves_by_destination.get(order.current_province.name, set()) - {order}
             for move_here in moves_here:
@@ -270,7 +292,7 @@ class MovesAdjudicator(Adjudicator):
                 ):
                     return Resolution.FAILS
             return Resolution.SUCCEEDS
-        elif order.type == OrderType.CONVOY:
+        if order.type == OrderType.CONVOY:
             moves_here = self.moves_by_destination.get(order.current_province.name, set())
             for move_here in moves_here:
                 # see https://webdiplomacy.net/doc/DATC_v3_0.html#5.D
@@ -278,15 +300,18 @@ class MovesAdjudicator(Adjudicator):
                     return Resolution.FAILS
             return Resolution.SUCCEEDS
         # Algorithm from https://diplom.org/Zine/S2009M/Kruijswijk/DipMath_Chp2.htm
-        elif order.type == OrderType.MOVE:
+        if order.type == OrderType.MOVE:
             return self._adjudicate_move_order(order)
         raise ValueError("Unknown order type for adjudication")
 
     def _count_strength(self, order: AdjudicableOrder, attacked_country: Player | None = None) -> int:
         # Your own unit counts, unless it's a difficult adjacency
-        strength = 0 if order.destination_province.name in order.base_unit.province.adjacency_data.difficult_adjacencies else 1
+        strength = 0
+        if order.destination_province.name not in order.base_unit.province.adjacency_data.difficult_adjacencies:
+            strength += 1
         for support in order.supports:
-            if self._resolve_order(support) == Resolution.SUCCEEDS and attacked_country != support.country:
+            if (self._resolve_order(support) == Resolution.SUCCEEDS
+                and (support.country is None or attacked_country != support.country)):
                 strength += 1
         return strength
 

@@ -1,6 +1,7 @@
 """Armies and fleets and so forth."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,11 @@ class UnitType(Enum):
     ARMY = "A"
     FLEET = "F"
 
+@dataclass
+class DPAllocation:
+    """Dataclass for storing DP allocation information."""
+    points: int
+    order: order.UnitOrder
 
 class Unit:
     """Units information. They don't have a lot of logic to them aside from retreat options at the moment."""
@@ -36,6 +42,8 @@ class Unit:
         self.retreat_options: set[tuple[province.Province, str | None]] | None = None
         self.order: order.UnitOrder | None = None
 
+        self.dp_allocations: dict[str, DPAllocation] = {}
+
     def __str__(self):
         return f"{self.unit_type.value} {self.province.get_name(self.coast)}"
 
@@ -45,10 +53,12 @@ class Unit:
             self.retreat_options = set()
         if self.unit_type == UnitType.ARMY:
             for province in self.province.adjacency_data.adjacent:
-                if province.type != ProvinceType.SEA:
+                if province.type in (ProvinceType.LAND, ProvinceType.ISLAND) and not province.is_impassable:
                     self.retreat_options.add((province, None))
         else:
             for province in self.province.get_coastal_adjacent(self.coast):
+                if province[0].is_impassable:
+                    continue
                 if isinstance(province, tuple):
                     self.retreat_options.add(province)
                 else:

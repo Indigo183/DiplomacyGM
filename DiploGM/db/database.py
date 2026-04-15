@@ -1,3 +1,4 @@
+"""Module to handle database interactions."""
 import logging
 import sqlite3
 from collections.abc import Iterable
@@ -10,29 +11,12 @@ from DiploGM.models.province import Province
 from DiploGM.models.turn import Turn
 from DiploGM.models.board import Board
 from DiploGM.models.order import (
-    Core,
-    NMR,
-    Hold,
-    Move,
-    Support,
-    ConvoyTransport,
-    RetreatDisband,
-    RetreatMove,
-    PlayerOrder,
-    Build,
-    Disband,
-    Transform,
-    TransformBuild,
-    Vassal,
-    Liege,
-    DualMonarchy,
-    Disown,
-    Defect,
-    RebellionMarker,
+    PlayerOrder, Build, Disband, TransformBuild,
+    Vassal, Liege, DualMonarchy, Disown, Defect, RebellionMarker
 )
 from DiploGM.models.player import Player
 from DiploGM.models.spec_request import SpecRequest
-from DiploGM.models.unit import UnitType, Unit
+from DiploGM.models.unit import DPAllocation, UnitType, Unit
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +38,7 @@ class _DatabaseConnection:
 
     def _initialize_schema(self):
         # FIXME: move the sql file somewhere more accessible (maybe it shouldn't be inside the package? /resources ?)
-        with open("DiploGM/db/schema.sql", "r") as sql_file:
+        with open("DiploGM/db/schema.sql", "r", encoding="utf-8") as sql_file:
             cursor = self._connection.cursor()
             cursor.executescript(sql_file.read())
             cursor.close()
@@ -200,7 +184,9 @@ class _DatabaseConnection:
 
         owner, core, half_core = province_info_by_name[province.name]
 
-        if owner is not None:
+        if owner == "Impassable" or owner is None:
+            province.owner = None
+        else:
             owner_player = board.get_player(owner)
             if owner_player is None:
                 logger.warning(
@@ -211,8 +197,8 @@ class _DatabaseConnection:
 
                 if province.has_supply_center:
                     owner_player.centers.add(province)
-        else:
-            province.owner = None
+
+        province.is_impassable = owner == "Impassable"
 
         core_player = None
         if core is not None:
@@ -269,51 +255,30 @@ class _DatabaseConnection:
 
         if order_type is None:
             return
-        order_classes = [
-            NMR,
-            Hold,
-            Core,
-            Transform,
-            Move,
-            ConvoyTransport,
-            Support,
-            RetreatMove,
-            RetreatDisband,
-            ]
         try:
-            order_class = next(
-                _class
-                for _class in order_classes
-                if _class.__name__ == order_type
-            )
-            source_province, destination_province, destination_coast = None, None, None
-            if order_destination is not None:
-                if len(order_destination) == 2 and order_destination[1] == "c":
-                    destination_coast = order_destination
-                else:
-                    destination_province, destination_coast = (
-                        board.get_province_and_coast(order_destination)
-                    )
-            if order_source is not None:
-                source_province = board.get_province(order_source)
-            if order_class == NMR:
-                return
-            if order_class in [Hold, Core, RetreatDisband]:
-                order = order_class()
-            elif order_class in [Transform]:
-                order = order_class(destination_coast=destination_coast)
-            elif order_class in [Move, RetreatMove]:
-                order = order_class(destination=destination_province, destination_coast=destination_coast)
-            elif order_class in [ConvoyTransport, Support]:
-                order = order_class(
-                    destination=destination_province, source=source_province, destination_coast=destination_coast
-                )
-            else:
-                raise ValueError(f"Could not parse {order_class}")
-
-            order.has_failed = has_failed
+            order = board.parse_order(order_type, order_destination, order_source)
+            if order is not None:
+                order.has_failed = has_failed
             unit.order = order
-        except:
+        except ValueError:
+            logger.warning("BAD UNIT INFO: replacing with hold")
+
+    def _load_dp_orders(self, board: Board, dp_data: tuple):
+        location, player_name, points, order_type, order_destination, order_source = dp_data
+        province = board.get_province(location)
+        unit = province.unit
+        if unit is None:
+            logger.warning(f"Couldn't find unit for DP order at {location}")
+            return
+        player = board.get_player(player_name)
+        if player is None:
+            logger.warning(f"Couldn't find player {player_name} for DP order at {location}")
+            return
+        try:
+            dp_order = board.parse_order(order_type, order_destination, order_source)
+            if dp_order is not None:
+                unit.dp_allocations[player.name] = DPAllocation(int(points), dp_order)
+        except ValueError:
             logger.warning("BAD UNIT INFO: replacing with hold")
 
     def _get_board(
@@ -344,13 +309,18 @@ class _DatabaseConnection:
         # Turning a key deliniated with slashes into a nested dict
         for key, value in board_params:
             cur_dict = board.data
+            cur_custom_dict = board.custom_data
             split_key = key.split("/", 1)
             while len(split_key) > 1:
                 if split_key[0] not in cur_dict:
                     cur_dict[split_key[0]] = {}
+                if split_key[0] not in cur_custom_dict:
+                    cur_custom_dict[split_key[0]] = {}
                 cur_dict = cur_dict[split_key[0]]
+                cur_custom_dict = cur_custom_dict[split_key[0]]
                 split_key = split_key[1].split("/", 1)
             cur_dict[split_key[0]] = value
+            cur_custom_dict[split_key[0]] = value
         if board.data["players"] != "chaos":
             board.update_players()
 
@@ -396,7 +366,9 @@ class _DatabaseConnection:
                 (board_id, board.turn.get_indexed_name()))
 
         unit_data = cursor.execute(
-            "SELECT location, is_dislodged, owner, is_army, order_type, order_destination, order_source, failed_order FROM units WHERE board_id=? and phase=?",
+            "SELECT location, is_dislodged, owner, is_army, order_type, " +
+                   "order_destination, order_source, failed_order " +
+            "FROM units WHERE board_id=? and phase=?",
             (board_id, board.turn.get_indexed_name()),
         ).fetchall()
         for province in board.provinces:
@@ -405,11 +377,42 @@ class _DatabaseConnection:
         board.units.clear()
         for unit_info in unit_data:
             self._load_unit(board, board_id, unit_info, cursor)
+
+        dp_data = cursor.execute(
+            "SELECT location, player, points, order_type, order_destination, order_source " +
+            "FROM dp_orders WHERE board_id=? and phase=?",
+            (board_id, board.turn.get_indexed_name()),
+        ).fetchall()
+        for dp_info in dp_data:
+            self._load_dp_orders(board, dp_info)
+
+        board.run_variant_scripts()
+
         return board
 
     def save_board(self, board_id: int, board: Board):
+        """Saves a board to the database."""
+        def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
+            items = {}
+            for k, v in d.items():
+                new_key = f"{parent_key}{sep}{k}" if parent_key else k
+                if isinstance(v, dict):
+                    items.update(flatten_dict(v, new_key, sep=sep))
+                else:
+                    items[new_key] = v
+            return items
+
         # TODO: Check if board already exists
         cursor = self._connection.cursor()
+
+        cursor.executemany(
+            "INSERT OR REPLACE INTO board_parameters (board_id, parameter_key, parameter_value) VALUES (?, ?, ?)",
+            [
+                (board_id, key, str(value))
+                for key, value in flatten_dict(board.custom_data).items()
+            ],
+        )
+
         cursor.execute(
             "INSERT INTO boards (board_id, phase, data_file, fish, name) VALUES (?, ?, ?, ?, ?)",
             (board_id, board.turn.get_indexed_name(), board.datafile, board.fish, board.name),
@@ -462,7 +465,7 @@ class _DatabaseConnection:
                     board_id,
                     board.turn.get_indexed_name(),
                     province.name,
-                    province.owner.name if province.owner else None,
+                    province.get_owner_name(),
                     province.core_data.core.name if province.core_data.core else None,
                     province.core_data.half_core.name if province.core_data.half_core else None,
                 )
@@ -520,10 +523,31 @@ class _DatabaseConnection:
                 for retreat_option in unit.retreat_options
             ],
         )
+        cursor.executemany(
+            "INSERT INTO dp_orders (board_id, phase, location, player, points, " +
+                                   "order_type, order_destination, order_source) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    board_id,
+                    board.turn.get_indexed_name(),
+                    unit.province.get_name(unit.coast),
+                    dp_player,
+                    dp_order.points,
+                    dp_order.order.__class__.__name__,
+                    dp_order.order.get_destination_str() if dp_order.order is not None else None,
+                    dp_order.order.get_source_str() if dp_order.order is not None else None,
+                )
+                for unit in board.units
+                if unit.player is None or not unit.player.is_active
+                for dp_player, dp_order in unit.dp_allocations.items()
+            ],
+        )
         cursor.close()
         self._connection.commit()
 
     def save_order_for_units(self, board: Board, units: Iterable[Unit]):
+        """Saves orders for the given units."""
         cursor = self._connection.cursor()
         cursor.executemany(
             "UPDATE units SET order_type=?, order_destination=?, order_source=?, failed_order=? "
@@ -541,6 +565,38 @@ class _DatabaseConnection:
                     unit.province.dislodged_unit == unit,
                 )
                 for unit in units
+            ],
+        )
+        cursor.executemany(
+            "DELETE FROM dp_orders WHERE board_id=? and phase=? and location=?",
+            [
+                (
+                    board.board_id,
+                    board.turn.get_indexed_name(),
+                    unit.province.get_name(unit.coast),
+                )
+                for unit in units
+                if unit.player is None or not unit.player.is_active
+            ],
+        )
+        cursor.executemany(
+            "INSERT INTO dp_orders (board_id, phase, location, player, points, order_type, " +
+                                   "order_destination, order_source) " +
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             [
+                (
+                    board.board_id,
+                    board.turn.get_indexed_name(),
+                    unit.province.get_name(unit.coast),
+                    dp_player,
+                    dp_order.points,
+                    dp_order.order.__class__.__name__,
+                    dp_order.order.get_destination_str() if dp_order.order is not None else None,
+                    dp_order.order.get_source_str() if dp_order.order is not None else None,
+                )
+                for unit in units
+                if unit.player is None or not unit.player.is_active
+                for dp_player, dp_order in unit.dp_allocations.items()
             ],
         )
         cursor.executemany(
@@ -573,6 +629,7 @@ class _DatabaseConnection:
         self._connection.commit()
 
     def save_build_orders_for_players(self, board: Board, player: Player | None):
+        """Stores build/disband/vassal/etc. orders for the given player, or all players if None."""
         if player is None:
             players = board.players
         else:
@@ -616,6 +673,7 @@ class _DatabaseConnection:
         self._connection.commit()
 
     def get_spec_requests(self) -> dict[int, list[SpecRequest]]:
+        """Gets all spec requests, organized by server ID."""
         requests = {}
 
         cursor = self._connection.cursor()
@@ -634,6 +692,7 @@ class _DatabaseConnection:
         return requests
 
     def save_spec_request(self, request: SpecRequest):
+        """Saves a spec request to the database."""
         cursor = self._connection.cursor()
 
         cursor.execute(
@@ -645,6 +704,7 @@ class _DatabaseConnection:
         self._connection.commit()
 
     def delete_board(self, board: Board):
+        """Deletes a board and all associated data for that phase."""
         cursor = self._connection.cursor()
         cursor.execute(
             "DELETE FROM boards WHERE board_id=? AND phase=?",
@@ -656,6 +716,10 @@ class _DatabaseConnection:
         )
         cursor.execute(
             "DELETE FROM units WHERE board_id=? AND phase=?",
+            (board.board_id, board.turn.get_indexed_name()),
+        )
+        cursor.execute(
+            "DELETE FROM dp_orders WHERE board_id=? AND phase=?",
             (board.board_id, board.turn.get_indexed_name()),
         )
         cursor.execute(
@@ -674,11 +738,13 @@ class _DatabaseConnection:
         self._connection.commit()
 
     def total_delete(self, board: Board):
+        """Deletes a board and all associated data, regardless of phase."""
         cursor = self._connection.cursor()
         cursor.execute("DELETE FROM boards WHERE board_id=?", (board.board_id,))
         cursor.execute("DELETE FROM board_parameters WHERE board_id=?", (board.board_id,))
         cursor.execute("DELETE FROM provinces WHERE board_id=?", (board.board_id,))
         cursor.execute("DELETE FROM units WHERE board_id=?", (board.board_id,))
+        cursor.execute("DELETE FROM dp_orders WHERE board_id=?", (board.board_id,))
         cursor.execute("DELETE FROM builds WHERE board_id=?", (board.board_id,))
         cursor.execute(
             "DELETE FROM retreat_options WHERE board_id=?", (board.board_id,)

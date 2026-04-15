@@ -4,7 +4,7 @@ import re
 from typing import TYPE_CHECKING
 from xml.etree.ElementTree import ElementTree, Element
 
-from DiploGM.map_parser.vector.utils import get_element_color, get_svg_element
+from DiploGM.map_parser.vector.utils import get_element_color, find_svg_element
 from DiploGM.map_parser.vector.transform import TransGL3
 
 if TYPE_CHECKING:
@@ -27,15 +27,15 @@ class PanelDrawer:
         self.player_colors = player_colors
         self.restriction = restriction
 
-        if not self.board_svg_data["power_banners"]:
-            return
-        all_power_banners_element = get_svg_element(
-            self.board_svg, self.board_svg_data["power_banners"]
+        all_power_banners_element = find_svg_element(
+            self.board_svg, "power_banners", self.board_svg_data
         )
+        if all_power_banners_element is None:
+            return
         self.scoreboard_power_locations: list[tuple[float, float]] = []
         for power_element in all_power_banners_element or []:
-            destination_pretransform_coordinates = (float(power_element[0].get("x", 0)),
-                                                    float(power_element[0].get("y", 0)))
+            destination_pretransform_coordinates = TransGL3(power_element[0]).transform((float(power_element[0].get("x", 0)),
+                                                                                         float(power_element[0].get("y", 0))))
             destination_coordinates = TransGL3(power_element).transform(destination_pretransform_coordinates)
             self.scoreboard_power_locations.append(destination_coordinates)
 
@@ -53,7 +53,8 @@ class PanelDrawer:
                            banner_index: int, high_player_count: bool) -> bool:
         if len(power_element) == 0:
             return False
-        initial_pretransform_coordinates = (float(power_element[0].get("x", 0)), float(power_element[0].get("y", 0)))
+        initial_pretransform_coordinates = TransGL3(power_element[0]).transform((float(power_element[0].get("x", 0)),
+                                                                                 float(power_element[0].get("y", 0))))
         banner_coordinates = TransGL3(power_element).transform(initial_pretransform_coordinates)
         if high_player_count and banner_coordinates != self.scoreboard_power_locations[banner_index]:
             return False
@@ -107,19 +108,19 @@ class PanelDrawer:
         root = svg.getroot()
         if root is None:
             raise ValueError("SVG root is None")
-        all_power_banners_element = get_svg_element(root, self.board_svg_data["power_banners"])
+        all_power_banners_element = find_svg_element(root, "power_banners", self.board_svg_data)
         if all_power_banners_element is None:
             return
 
         if self.board.fow and self.restriction is not None:
             # don't get info
-            players = sorted(self.board.players, key=lambda sort_player: sort_player.name)
+            players = sorted(self.board.get_players(), key=lambda sort_player: sort_player.name)
         else:
             players = self.board.get_players_sorted_by_score()
         players = sorted(players, key=lambda hidden_player:
-                                  self.board.data["players"][hidden_player.name].get("hidden", "false") == "true")
+                                  self.board.is_player_hidden(hidden_player))
 
-        high_player_count = (len(self.board.players) > len(self.scoreboard_power_locations)
+        high_player_count = (len(self.board.get_players()) > len(self.scoreboard_power_locations)
                              or self.board.data.get("vassals") == "enabled")
         for i, player in enumerate(self.board.get_players_sorted_by_score()):
             if i >= len(self.scoreboard_power_locations):
@@ -129,7 +130,7 @@ class PanelDrawer:
                     break
 
     def _draw_side_panel_date(self, svg: ElementTree) -> None:
-        date = get_svg_element(svg, self.board_svg_data["season"])
+        date = find_svg_element(svg, "season", self.board_svg_data)
         if date is None:
             return
         game_name = self.board.name

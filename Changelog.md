@@ -1,3 +1,102 @@
+1.8.1
+=====
+
+Contributors:
+- aahoughton
+
+# Quality of Life
+- No longer considers "dead" players when running the `.ping_players` command
+- Added aliases for the scheduling commands
+  - ["s", "sched"] == `.schedule`
+  - ["us", "unsched"] == `.unschedule`
+  - ["vs", "vsched", "viewsched"] == `.view_schedule`
+- Defaulted `.view_map` behaviour to use the "standard" colour mode, 
+
+# GM Changes
+- GMs can provide power roles to `.press_directory` to generate local copies in a GM channel
+
+# Bugfixes
+- Resolved error with requiring gm arguments when calling `.press_directory`
+
+1.8.0
+=====
+
+Contributors
+- Golden Kumuqat
+
+# New Features
+- If a player did not order enough disbands, units will automatically be removed via civil disorder rules
+- More DP updates:
+  - Each power has a designated maximum number of DP that they can allocate per turn, set by default to 1/SC with a max of 3
+  - If a player tries to allocate more DP than available, some DP allocations will be redered invalid
+  - `.ping_players` now alerts when someone has unspent or overspent DP
+  - Added `.edit_game dp <disabled|enabled>`
+- Added `.export_game` which outputs a JSON file of the current board state
+- Added `.import_game` which creates a new game based on an exported JSON file
+- Added `.rename_player` which changes a player's name and attempts to edit their role and channel names
+- Variants can have custom scripts that can be loaded to give per-variant special rules
+
+# Quality of Life
+- More support for impassable provinces
+  - Impassable provinces can now be included in the land/island/sea layers of the SVG and be parsed
+  - Units can be ordered to impassable provinces, but they will automatically fail
+  - `.edit set_province_owner <province> Impassable` now turns a province impassable
+- `.adjudicate full` no longer converts the SVG to PNG twice for adjudication, saving up to 30 seconds per adjudication
+- When parsing an SVG, the parser will now look for common layer names in addition to values supplied in the config.json's svg_config
+- If there are multiple possible convoys for a unit, all will be displayed on the map
+- Supports for a convoy will now point to the final fleet instead of all the way at the starting army
+
+# Developer Changes
+- Created some helper functions for common usage
+- Combined logic with the nearly-identical `.view_map` and `.view_current`
+- Moved parsing order strings from database to board
+- Used a significantly faster function for adjacency searching
+
+# Bugfixes
+`.last_message` now properly works for renamed players
+
+1.7.2
+=====
+
+Contributors
+- Golden Kumuqat
+
+# New Features
+- Added rudimentary support for DP orders
+  - Implementation follows the basic guidelines as laid out in https://nopunin10did.com/common-ruleset-for-dp-based-variants/
+  - Powers can have "affiliates" that provide double strength DP allocations
+  - DP allocations still need to be tracked manually for now
+- Added Sortie option to Moves, which causes the unit to bounce/cut supports/etc., but does not actually move or dislodge the unit
+- Added `.last_message` to track the last time each player has sent a message in the game's server
+- Implemented non-active powers that are not controlled by a player but can have units that can be ordered (such as via DP)
+  - Provinces in the initial SVG that do not have a power's color or a neutral color are considered part of a non-active power
+  - Non-active powers can also be defined in the config by setting "active" to "false"
+
+# Quality of Life
+- Standarised some of the .help commands, particularly under Game Management
+- Added support for each variant to have a config.json that each version can see and overwrite
+- Added support for per-variant color palettes
+- Upon loading a variant, the Parser now checks to see if there are any mismatching SVG labels before continuing
+
+# Developer Changes
+- Added a `.get_distance` method for Provinces, which is to be used for future development
+- Renamed some ImpDip-specific terminology in the code
+
+# Bugfixes
+- `.adjudicate test` now displays red arrows for failed moves again
+- Fixed a couple more issues regarding score panel generation
+
+# Known Issues
+- Score panel generation does not quite work with matrix transformations yet
+
+1.7.1
+=====
+Contributors
+- notnot
+
+# New Features
+- Added 'forced-disband' and 'free-retreat' arguments to view_orders; view which orders are forced retreats, or hide all forced retreats.
+
 1.7.0
 =====
 
